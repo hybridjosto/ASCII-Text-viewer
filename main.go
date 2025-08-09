@@ -2,8 +2,10 @@ package main
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/charmbracelet/bubbles/textinput"
@@ -26,6 +28,7 @@ import (
 // - Edit fields with Tab to move focus.
 // - Text updates live; colors apply as you type valid hex (e.g. #8A2BE2).
 // - Press 'm' to toggle render mode (BLOCK/GLYPH/LIGHT/DOTS).
+// - Press 'a' to toggle animated hue cycling. Use '+' and '-' to change speed.
 
 //------------------------------------------------------------------------------
 // Model & Types
@@ -74,6 +77,81 @@ func parseHexColor(s string) (colorRGB, bool) {
 	}
 }
 
+// HSV helpers for hue rotation
+func clamp01(x float64) float64 { return math.Max(0, math.Min(1, x)) }
+
+func rgbToHsv(c colorRGB) (h, s, v float64) {
+	r := float64(c.R) / 255.0
+	g := float64(c.G) / 255.0
+	b := float64(c.B) / 255.0
+	maxv := math.Max(r, math.Max(g, b))
+	minv := math.Min(r, math.Min(g, b))
+	d := maxv - minv
+	v = maxv
+	if maxv == 0 { // black
+		return 0, 0, 0
+	}
+	s = 0
+	if maxv != 0 {
+		s = d / maxv
+	}
+	if d == 0 {
+		h = 0
+	} else {
+		switch maxv {
+		case r:
+			h = (g - b) / d
+			if g < b {
+				h += 6
+			}
+		case g:
+			h = (b-r)/d + 2
+		case b:
+			h = (r-g)/d + 4
+		}
+		h *= 60
+	}
+	return
+}
+
+func hsvToRgb(h, s, v float64) colorRGB {
+	h = math.Mod(h, 360)
+	if h < 0 {
+		h += 360
+	}
+	c := v * s
+	x := c * (1 - math.Abs(math.Mod(h/60.0, 2)-1))
+	m := v - c
+	var r1, g1, b1 float64
+	switch {
+	case h < 60:
+		r1, g1, b1 = c, x, 0
+	case h < 120:
+		r1, g1, b1 = x, c, 0
+	case h < 180:
+		r1, g1, b1 = 0, c, x
+	case h < 240:
+		r1, g1, b1 = 0, x, c
+	case h < 300:
+		r1, g1, b1 = x, 0, c
+	default:
+		r1, g1, b1 = c, 0, x
+	}
+	return colorRGB{int((r1 + m) * 255), int((g1 + m) * 255), int((b1 + m) * 255)}
+}
+
+func rotateHue(c colorRGB, delta float64) colorRGB {
+	h, s, v := rgbToHsv(c)
+	return hsvToRgb(h+delta, s, v)
+}
+
+// Messages for animation tick
+type tickMsg time.Time
+
+func tickEvery(d time.Duration) tea.Cmd {
+	return tea.Tick(d, func(t time.Time) tea.Msg { return tickMsg(t) })
+}
+
 type model struct {
 	w, h int
 
@@ -88,15 +166,21 @@ type model struct {
 	artLines []string
 	maxWidth int
 
-	// Colors
-	start colorRGB
-	end   colorRGB
+	// Colors (base are user-chosen; effective may be hue-rotated)
+	baseStart colorRGB
+	baseEnd   colorRGB
 
 	// Mode
 	mode renderMode
+
+	// Animation
+	animate  bool
+	hueShift float64       // degrees
+	stepDeg  float64       // degrees per tick
+	interval time.Duration // tick interval
 }
 
-// FIGlet font names supported by go-figure (curated selection + extended list)
+// FIGlet fonts list
 var figFonts = []string{
 	"standard", "big", "doom", "slant", "shadow", "block", "banner", "larry3d", "speed", "smslant", "small", "isometric1",
 	"3-d", "3x5", "5lineoblique", "acrobatic", "alligator", "alligator2", "alphabet",
@@ -133,9 +217,13 @@ func newModel() model {
 	m := model{
 		fonts:     figFonts,
 		fontIndex: 0,
-		start:     colorRGB{138, 43, 226}, // #8A2BE2
-		end:       colorRGB{0, 255, 255},  // #00FFFF
+		baseStart: colorRGB{138, 43, 226}, // #8A2BE2
+		baseEnd:   colorRGB{0, 255, 255},  // #00FFFF
 		mode:      modeGlyph,              // default: keep original glyphs
+		animate:   true,
+		hueShift:  0,
+		stepDeg:   3,                     // degrees per tick
+		interval:  60 * time.Millisecond, // ~16 FPS
 	}
 	m.inputs = []textinput.Model{
 		newTextInput("text", "glam dm"),
@@ -166,7 +254,12 @@ func (m *model) rebuildArt() {
 // Bubble Tea
 //------------------------------------------------------------------------------
 
-func (m model) Init() tea.Cmd { return nil }
+func (m model) Init() tea.Cmd {
+	if m.animate {
+		return tickEvery(m.interval)
+	}
+	return nil
+}
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
@@ -175,7 +268,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case tea.KeyMsg:
 		switch msg.String() {
-		case "esc", "ctrl+c":
+		case "q", "esc", "ctrl+c":
 			return m, tea.Quit
 		case "tab", "shift+tab":
 			if msg.String() == "shift+tab" {
@@ -208,7 +301,25 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "m":
 			m.mode = (m.mode + 1) % renderMode(len(modeNames))
 			return m, nil
+		case "a":
+			m.animate = !m.animate
+			if m.animate {
+				return m, tickEvery(m.interval)
+			}
+			return m, nil
+		case "+", "=":
+			m.stepDeg = math.Min(30, m.stepDeg+0.5)
+			return m, nil
+		case "-", "_":
+			m.stepDeg = math.Max(0.5, m.stepDeg-0.5)
+			return m, nil
 		}
+	case tickMsg:
+		if m.animate {
+			m.hueShift = math.Mod(m.hueShift+m.stepDeg, 360)
+			return m, tickEvery(m.interval)
+		}
+		return m, nil
 	}
 
 	// Update inputs and live-apply changes
@@ -222,12 +333,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	// Text changes rebuild art
 	m.rebuildArt()
 
-	// Colors update when valid
+	// Colors update when valid (these are bases for hue rotation)
 	if c, ok := parseHexColor(m.inputs[1].Value()); ok {
-		m.start = c
+		m.baseStart = c
 	}
 	if c, ok := parseHexColor(m.inputs[2].Value()); ok {
-		m.end = c
+		m.baseEnd = c
 	}
 
 	return m, tea.Batch(cmds...)
@@ -238,16 +349,29 @@ func (m model) View() string {
 		return "\n  loading…"
 	}
 
+	// Effective colors (possibly hue-rotated)
+	effStart := m.baseStart
+	effEnd := m.baseEnd
+	if m.animate {
+		effStart = rotateHue(effStart, m.hueShift)
+		effEnd = rotateHue(effEnd, m.hueShift)
+	}
+
 	// Controls panel
 	labelStyle := lipgloss.NewStyle().Faint(true)
 	box := lipgloss.NewStyle().Padding(0, 1).Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("8"))
 
+	animState := "off"
+	if m.animate {
+		animState = fmt.Sprintf("on (%.1f°/tick)", m.stepDeg)
+	}
 	ctrlLines := []string{
 		labelStyle.Render("Text:") + " " + m.inputs[0].View(),
 		labelStyle.Render("Start:") + " " + m.inputs[1].View(),
 		labelStyle.Render("End:") + " " + m.inputs[2].View(),
-		labelStyle.Render("Font:") + " " + currentFontChip(m.fonts[m.fontIndex]) + "  (←/→ or [/])",
-		labelStyle.Render("Mode:") + " " + currentModeChip(modeNames[m.mode]) + "  (m)",
+		labelStyle.Render("Font:") + " " + currentChip(m.fonts[m.fontIndex], "212", "57") + "  (←/→ or [/])",
+		labelStyle.Render("Mode:") + " " + currentChip(modeNames[m.mode], "118", "237") + "  (m)",
+		labelStyle.Render("Hue cycle:") + " " + currentChip(animState, "51", "240") + "  (a, +/-)",
 	}
 	controls := box.Render(strings.Join(ctrlLines, "\n"))
 
@@ -268,9 +392,8 @@ func (m model) View() string {
 			if m.maxWidth > 1 {
 				t = float64(x) / float64(m.maxWidth-1)
 			}
-			c := lerp(m.start, m.end, t)
+			c := lerp(effStart, effEnd, t)
 			style := lipgloss.NewStyle().Foreground(lipgloss.Color(c.Hex()))
-
 			switch m.mode {
 			case modeBlock:
 				b.WriteString(style.Render("█"))
@@ -292,12 +415,8 @@ func (m model) View() string {
 	return lipgloss.Place(m.w, m.h, lipgloss.Center, lipgloss.Center, content)
 }
 
-func currentFontChip(name string) string {
-	return lipgloss.NewStyle().Foreground(lipgloss.Color("212")).Background(lipgloss.Color("57")).Padding(0, 1).Render(name)
-}
-
-func currentModeChip(name string) string {
-	return lipgloss.NewStyle().Foreground(lipgloss.Color("118")).Background(lipgloss.Color("237")).Padding(0, 1).Render(name)
+func currentChip(name, fg, bg string) string {
+	return lipgloss.NewStyle().Foreground(lipgloss.Color(fg)).Background(lipgloss.Color(bg)).Padding(0, 1).Render(name)
 }
 
 func max(a, b int) int {
@@ -309,7 +428,7 @@ func max(a, b int) int {
 
 func main() {
 	p := tea.NewProgram(newModel(), tea.WithAltScreen())
-	if _, err := p.Run(); err != nil {
+	if err := p.Start(); err != nil {
 		fmt.Println("error:", err)
 		os.Exit(1)
 	}
