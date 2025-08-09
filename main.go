@@ -25,10 +25,22 @@ import (
 // - Cycle fonts with ←/→ (left/right) or [/] .
 // - Edit fields with Tab to move focus.
 // - Text updates live; colors apply as you type valid hex (e.g. #8A2BE2).
+// - Press 'm' to toggle render mode (BLOCK/GLYPH/LIGHT/DOTS).
 
 //------------------------------------------------------------------------------
-// Model
+// Model & Types
 //------------------------------------------------------------------------------
+
+type renderMode int
+
+const (
+	modeBlock renderMode = iota // Replace glyphs with full block (█)
+	modeGlyph                   // Keep original FIGlet glyphs
+	modeLight                   // Medium block (▓)
+	modeDots                    // Dotted look (·)
+)
+
+var modeNames = []string{"BLOCK █", "GLYPH", "LIGHT ▓", "DOTS ·"}
 
 type colorRGB struct{ R, G, B int }
 
@@ -79,9 +91,12 @@ type model struct {
 	// Colors
 	start colorRGB
 	end   colorRGB
+
+	// Mode
+	mode renderMode
 }
 
-// Predefined list of popular FIGlet font names supported by go-figure.
+// FIGlet font names supported by go-figure (curated selection + extended list)
 var figFonts = []string{
 	"standard", "big", "doom", "slant", "shadow", "block", "banner", "larry3d", "speed", "smslant", "small", "isometric1",
 	"3-d", "3x5", "5lineoblique", "acrobatic", "alligator", "alligator2", "alphabet",
@@ -120,6 +135,7 @@ func newModel() model {
 		fontIndex: 0,
 		start:     colorRGB{138, 43, 226}, // #8A2BE2
 		end:       colorRGB{0, 255, 255},  // #00FFFF
+		mode:      modeGlyph,              // default: keep original glyphs
 	}
 	m.inputs = []textinput.Model{
 		newTextInput("text", "glam dm"),
@@ -159,7 +175,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case tea.KeyMsg:
 		switch msg.String() {
-		case "q", "esc", "ctrl+c":
+		case "esc", "ctrl+c":
 			return m, tea.Quit
 		case "tab", "shift+tab":
 			if msg.String() == "shift+tab" {
@@ -188,6 +204,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "right", "]":
 			m.fontIndex = (m.fontIndex + 1) % len(m.fonts)
 			m.rebuildArt()
+			return m, nil
+		case "m":
+			m.mode = (m.mode + 1) % renderMode(len(modeNames))
 			return m, nil
 		}
 	}
@@ -228,10 +247,11 @@ func (m model) View() string {
 		labelStyle.Render("Start:") + " " + m.inputs[1].View(),
 		labelStyle.Render("End:") + " " + m.inputs[2].View(),
 		labelStyle.Render("Font:") + " " + currentFontChip(m.fonts[m.fontIndex]) + "  (←/→ or [/])",
+		labelStyle.Render("Mode:") + " " + currentModeChip(modeNames[m.mode]) + "  (m)",
 	}
 	controls := box.Render(strings.Join(ctrlLines, "\n"))
 
-	// Build colored block-art from ASCII using per-column gradient
+	// Build colored art from ASCII using per-column gradient & render modes
 	rows := make([]string, len(m.artLines))
 	for y, line := range m.artLines {
 		if len(line) < m.maxWidth {
@@ -250,7 +270,17 @@ func (m model) View() string {
 			}
 			c := lerp(m.start, m.end, t)
 			style := lipgloss.NewStyle().Foreground(lipgloss.Color(c.Hex()))
-			b.WriteString(style.Render("█"))
+
+			switch m.mode {
+			case modeBlock:
+				b.WriteString(style.Render("█"))
+			case modeLight:
+				b.WriteString(style.Render("▓"))
+			case modeDots:
+				b.WriteString(style.Render("·"))
+			case modeGlyph:
+				b.WriteString(style.Render(string(ch)))
+			}
 		}
 		rows[y] = b.String()
 	}
@@ -266,6 +296,10 @@ func currentFontChip(name string) string {
 	return lipgloss.NewStyle().Foreground(lipgloss.Color("212")).Background(lipgloss.Color("57")).Padding(0, 1).Render(name)
 }
 
+func currentModeChip(name string) string {
+	return lipgloss.NewStyle().Foreground(lipgloss.Color("118")).Background(lipgloss.Color("237")).Padding(0, 1).Render(name)
+}
+
 func max(a, b int) int {
 	if a > b {
 		return a
@@ -275,7 +309,7 @@ func max(a, b int) int {
 
 func main() {
 	p := tea.NewProgram(newModel(), tea.WithAltScreen())
-	if err := p.Start(); err != nil {
+	if _, err := p.Run(); err != nil {
 		fmt.Println("error:", err)
 		os.Exit(1)
 	}
